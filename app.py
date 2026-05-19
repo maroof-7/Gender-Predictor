@@ -48,17 +48,21 @@ def train_from_csv():
     FEATURE_COLS = list(df.columns[:-1])
     print(f"   Target  : {TARGET_COL}")
 
-    # Encode any string columns that are FEATURES
+    # Encode any string or categorical columns that are FEATURES
     encoders = {}
-    cat_feat_cols = [c for c in FEATURE_COLS if df[c].dtype == object]
+    cat_feat_cols = [
+        c for c in FEATURE_COLS
+        if df[c].dtype == object or str(df[c].dtype) == 'category'
+    ]
     for col in cat_feat_cols:
         le = LabelEncoder()
         df[col] = le.fit_transform(df[col].astype(str))
         encoders[col] = le
         print(f"   Encoded feature '{col}': {list(le.classes_)}")
 
-    # Encode target if it is a string
-    if df[TARGET_COL].dtype == object:
+    # Encode target if it is a string or category
+    target_dtype = df[TARGET_COL].dtype
+    if target_dtype == object or target_dtype.name == 'category':
         IS_CLASSIFIER = True
         le_t = LabelEncoder()
         df[TARGET_COL] = le_t.fit_transform(df[TARGET_COL].astype(str))
@@ -71,6 +75,8 @@ def train_from_csv():
         print(f"   Target has {n_unique} unique values → {kind}")
 
     df = df.dropna()
+    if df.empty:
+        raise ValueError("Dataset is empty after dropping missing values")
     X = df[FEATURE_COLS].astype(float).values
     y = df[TARGET_COL].values
 
@@ -83,7 +89,7 @@ def train_from_csv():
 
     # Find best K
     print("\n🔍 Searching for best K (1–15) …")
-    best_score, best_k = -9999, 5
+    best_score, best_k = -np.inf, 5
     for k in range(1, 16):
         if IS_CLASSIFIER:
             m = KNeighborsClassifier(n_neighbors=k)
@@ -146,11 +152,25 @@ def load_from_disk():
 # ═══════════════════════════════════════════════════════════════
 #  STARTUP — train or load
 # ═══════════════════════════════════════════════════════════════
-if all(os.path.exists(p) for p in [MODEL_PATH, SCALER_PATH, META_PATH]):
-    load_from_disk()
-else:
-    print("⚠️  No saved model — training from gender.csv …")
-    train_from_csv()
+def initialize_model():
+    if all(os.path.exists(p) for p in [MODEL_PATH, SCALER_PATH, META_PATH]):
+        try:
+            load_from_disk()
+        except Exception as exc:
+            print("⚠️  Failed to load saved model:", exc)
+            if os.path.exists(CSV_PATH):
+                train_from_csv()
+            else:
+                raise
+    elif os.path.exists(CSV_PATH):
+        print("⚠️  No saved model — training from gender.csv …")
+        train_from_csv()
+    else:
+        raise FileNotFoundError(
+            f"No saved model and no dataset found at: {CSV_PATH}"
+        )
+
+initialize_model()
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -215,18 +235,26 @@ def build_vector(data):
 
 @app.route('/')
 def home():
-    return render_template('index.html')
+    index_path = os.path.join(BASE, 'templates', 'index.html')
+    if os.path.exists(index_path):
+        return render_template('index.html')
+    return (
+        "<html><body>"
+        "<h1>KNN-2 API</h1>"
+        "<p>Use POST /api/predict with JSON body or POST /retrain.</p>"
+        "</body></html>"
+    )
 
 
 @app.route('/accuracy')
 def accuracy():
     """Called by the HTML page on load to show accuracy + K value."""
     return jsonify({
-        'accuracy':   round(float(MODEL_SCORE), 4),
-        'best_k':     int(BEST_K),
+        'accuracy':   round(float(MODEL_SCORE or 0.0), 4),
+        'best_k':     int(BEST_K or 0),
         'model_type': 'classifier' if IS_CLASSIFIER else 'regressor',
-        'target':     TARGET_COL,
-        'n_features': len(FEATURE_COLS),
+        'target':     TARGET_COL or '',
+        'n_features': len(FEATURE_COLS) if FEATURE_COLS else 0,
     })
 
 
@@ -248,6 +276,8 @@ def predict():
         data = request.get_json(force=True)
         if not data:
             return jsonify({'error': 'No JSON received'}), 400
+        if model is None or scaler is None:
+            return jsonify({'error': 'Model is not initialized'}), 503
 
         X_scaled = scaler.transform(build_vector(data))
         raw_pred = model.predict(X_scaled)[0]
@@ -284,7 +314,7 @@ def info():
         'score':         MODEL_SCORE,
         'is_classifier': IS_CLASSIFIER,
         'target_col':    TARGET_COL,
-        'feature_cols':  FEATURE_COLS,
+        'feature_cols':  FEATURE_COLS or [],
         'encoders':      {k: list(v.classes_)
                           for k, v in encoders.items() if k != '__target__'},
     })
